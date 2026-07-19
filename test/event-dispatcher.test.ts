@@ -198,6 +198,8 @@ function setupBotState(opts?: {
 	    chats?: string[];
 	    topicGroups?: boolean;
 	    topicActiveSessionTrigger?: boolean;
+	    senderPolicy?: 'whitelist' | 'trustChat';
+	    allowedSenders?: Array<{ openId?: string; unionId?: string; name?: string }>;
 	  };
 	}) {
   mockGetBot.mockReturnValue({
@@ -3267,6 +3269,160 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.resolveReplyThreadAlias).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+});
+
+describe('im.message.receive_v1 — app-sender substitute trigger (senderPolicy)', () => {
+  const SUBSTITUTE_TARGET_OPEN_ID = 'ou_substitute_target';
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockReplyMessage.mockClear();
+    mockGetOwnerOpenId.mockReset();
+    mockGetOwnerOpenId.mockReturnValue(undefined);
+    mockGetCachedChatMode.mockReset();
+    mockGetCachedChatMode.mockReturnValue(undefined);
+    mockRecordObservedBots.mockClear();
+    // 普通群 + 默认 per-chat 替身开关开。
+    mockGetChatMode.mockReset().mockResolvedValue('group');
+    mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
+    mockIsChatOncallBoundForAnyBot.mockReturnValue(false);
+    mockFindOncallChat.mockReturnValue(undefined);
+    handlers = makeHandlers();
+  });
+
+  function substituteMentionEvent(senderOpenId: string, opts?: { chatId?: string; messageId?: string; senderType?: string }) {
+    return makeBotMessageEvent({
+      senderOpenId,
+      senderType: opts?.senderType ?? 'app',
+      content: JSON.stringify({ text: '@_target 请代我回答这个问题' }),
+      chatId: opts?.chatId ?? 'chat-001',
+      chatType: 'group',
+      messageId: opts?.messageId ?? 'msg-sub-1',
+      mentions: [{ key: '@_target', name: 'Target', id: { open_id: SUBSTITUTE_TARGET_OPEN_ID } }],
+      rootId: undefined,
+    });
+  }
+
+  it('whitelist 命中 sender → 触发替身（handleNewTopic + substituteTrigger + chat-scope）', async () => {
+    setupBotState({
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: SUBSTITUTE_TARGET_OPEN_ID, name: 'Target' }],
+        senderPolicy: 'whitelist',
+        allowedSenders: [{ openId: OTHER_BOT_OPEN_ID, name: 'webhook' }],
+      },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = substituteMentionEvent(OTHER_BOT_OPEN_ID);
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      larkAppId: MY_APP_ID,
+      scope: 'chat',
+      anchor: 'chat-001',
+      substituteTrigger: expect.objectContaining({
+        target: expect.objectContaining({ openId: SUBSTITUTE_TARGET_OPEN_ID }),
+      }),
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('self-message（bot 自己发的）不触发替身（self-guard 在替身闸之前）', async () => {
+    setupBotState({
+      // allowedSenders 故意把 bot 自己也列进去——即便如此，self 路径也必须先 return。
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: SUBSTITUTE_TARGET_OPEN_ID }],
+        senderPolicy: 'whitelist',
+        allowedSenders: [{ openId: MY_OPEN_ID }],
+      },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = substituteMentionEvent(MY_OPEN_ID);
+    event.message.root_id = undefined as any;
+    // 非 /close 正文 → self 路径直接 return。
+    event.message.content = JSON.stringify({ text: '@_target some answer' });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('whitelist 未命中 sender → 不触发替身；消息未 @ bot → 也不走 foreign-bot 路由', async () => {
+    setupBotState({
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: SUBSTITUTE_TARGET_OPEN_ID }],
+        senderPolicy: 'whitelist',
+        // 空 allowedSenders = 不放开
+        allowedSenders: [],
+      },
+      allowedUsers: ['ou_owner'], // 受限态，避免开放模式人/bot 同权放行干扰
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = substituteMentionEvent(OTHER_BOT_OPEN_ID);
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('trustChat + chat 在白名单 → 触发替身（不挑 sender）', async () => {
+    setupBotState({
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: SUBSTITUTE_TARGET_OPEN_ID }],
+        senderPolicy: 'trustChat',
+        chats: ['chat-001'],
+      },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = substituteMentionEvent('ou_some_unknown_webhook', { senderType: 'bot' });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      substituteTrigger: expect.objectContaining({
+        target: expect.objectContaining({ openId: SUBSTITUTE_TARGET_OPEN_ID }),
+      }),
+    }));
+  });
+
+  it('trustChat + 空 chats（hand-edit）→ 运行时保守拒绝，不触发替身', async () => {
+    setupBotState({
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: SUBSTITUTE_TARGET_OPEN_ID }],
+        senderPolicy: 'trustChat',
+        // chats 缺省 → 空
+      },
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    const event = substituteMentionEvent('ou_some_webhook');
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 });
 

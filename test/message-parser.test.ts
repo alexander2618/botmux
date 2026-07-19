@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, extractMentionIdentities, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard } from '../src/im/lark/md-card.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -796,6 +796,80 @@ describe('parseEventMessage: parentId surfacing', () => {
 // REST API (im.message.get / list) → id is a bare STRING "ou_xxx" + id_type.
 // The helper must read open_id from either so a Lark shape convergence can't
 // silently break @-detection.
+
+describe('extractMentionIdentities: card body at-nodes', () => {
+  it('extracts at-nodes from simplified Format A 2-D elements', () => {
+    const mentions = extractMentionIdentities({
+      content: JSON.stringify({
+        elements: [[
+          { tag: 'text', text: 'hey ' },
+          { tag: 'at', user_id: 'ou_alice', user_name: 'Alice' },
+          { tag: 'at', user_id: 'ou_bob', user_name: 'Bob' },
+        ]],
+      }),
+    });
+    const openIds = mentions.map(m => m.openId).filter(Boolean);
+    expect(openIds).toEqual(['ou_alice', 'ou_bob']);
+    expect(mentions.find(m => m.openId === 'ou_alice')?.name).toBe('Alice');
+  });
+
+  it('extracts at-nodes nested in v2 body.elements containers (1-D + nested)', () => {
+    const mentions = extractMentionIdentities({
+      content: JSON.stringify({
+        body: { elements: [
+          { tag: 'div', text: { content: 'x' } },
+          { tag: 'note', elements: [
+            { tag: 'at', user_id: 'ou_carol', user_name: 'Carol' },
+          ] },
+          { tag: 'column_set', columns: [
+            { tag: 'column', elements: [{ tag: 'at', user_id: 'ou_dave', user_name: 'Dave' }] },
+          ] },
+        ] },
+      }),
+    });
+    expect(mentions.map(m => m.openId).filter(Boolean).sort()).toEqual(['ou_carol', 'ou_dave']);
+  });
+
+  it('skips @all and name-only at-nodes', () => {
+    const mentions = extractMentionIdentities({
+      content: JSON.stringify({
+        elements: [[
+          { tag: 'at', user_id: 'all', user_name: '所有人' },
+          { tag: 'at', user_name: 'NoId' },
+          { tag: 'at', user_id: 'ou_real', user_name: 'Real' },
+        ]],
+      }),
+    });
+    expect(mentions.map(m => m.openId).filter(Boolean)).toEqual(['ou_real']);
+  });
+
+  it('dedupes against top-level message.mentions[] (standard <at id> round-trip)', () => {
+    const mentions = extractMentionIdentities({
+      mentions: [{ key: '@_user_1', name: 'Alice', id: { open_id: 'ou_alice' } }],
+      content: JSON.stringify({
+        elements: [[{ tag: 'at', user_id: 'ou_alice', user_name: 'Alice' }]],
+      }),
+    });
+    expect(mentions.filter(m => m.openId === 'ou_alice')).toHaveLength(1);
+  });
+
+  it('still parses post at-nodes (no regression)', () => {
+    const mentions = extractMentionIdentities({
+      content: JSON.stringify({
+        zh_cn: { content: [[
+          { tag: 'text', text: 'hi ' },
+          { tag: 'at', user_id: 'ou_post', user_name: 'PostUser' },
+        ]] },
+      }),
+    });
+    expect(mentions.map(m => m.openId).filter(Boolean)).toEqual(['ou_post']);
+  });
+
+  it('ignores non-JSON / non-card content without throwing', () => {
+    expect(extractMentionIdentities({ content: 'not json' })).toEqual([]);
+    expect(extractMentionIdentities({})).toEqual([]);
+  });
+});
 
 describe('mentionOpenId', () => {
   it('reads open_id from the WS event object form', () => {

@@ -1,4 +1,4 @@
-import type { SubstituteModeConfig, SubstituteTarget } from '../bot-registry.js';
+import type { SubstituteModeConfig, SubstituteTarget, SubstituteAllowedSender } from '../bot-registry.js';
 
 /**
  * Pure normalizer for a raw substituteMode object (from bots.json OR a dashboard
@@ -56,5 +56,31 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
   const replyMode = rec.replyMode === 'quote' ? 'quote' : 'thread';
   if (replyMode === 'quote') out.replyMode = 'quote';
   if (rec.disableControlCard === true) out.disableControlCard = true;
+  // 发送方策略：缺省 whitelist；只接受 'trustChat'，其余一律兜底回 whitelist。
+  // whitelist 模式下空白名单 = 不放开（既有行为）；trustChat 的「必须 chats 非空」
+  // 跨字段校验由 updateBotSubstituteMode 在保存层做（normalize 只管单字段形状）。
+  out.senderPolicy = rec.senderPolicy === 'trustChat' ? 'trustChat' : 'whitelist';
+  // allowedSenders：只保留 openId/unionId/name（sender 侧无 app_id）；两者皆空的条目丢弃。
+  // 去重按 openId/unionId 任一非空键；trustChat 模式下也保留，方便来回切换不丢配置。
+  const senders: SubstituteAllowedSender[] = [];
+  if (Array.isArray(rec.allowedSenders)) {
+    const seen = new Set<string>();
+    for (const item of rec.allowedSenders) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const src = item as Record<string, unknown>;
+      const openId = typeof src.openId === 'string' ? src.openId.trim() : '';
+      const unionId = typeof src.unionId === 'string' ? src.unionId.trim() : '';
+      if (!openId && !unionId) continue;
+      const key = openId || unionId!;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const s: SubstituteAllowedSender = {};
+      if (openId) s.openId = openId;
+      if (unionId) s.unionId = unionId;
+      if (typeof src.name === 'string' && src.name.trim()) s.name = src.name.trim();
+      senders.push(s);
+    }
+  }
+  if (senders.length) out.allowedSenders = senders;
   return out;
 }

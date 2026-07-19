@@ -1119,6 +1119,35 @@ function isSubstituteAllowedChat(cfg: { chats?: string[] } | undefined, chatId: 
   return cfg.chats.includes(chatId);
 }
 
+/**
+ * senderPolicy 闸——app/bot 发送方（webhook 卡片、其它 bot 应用）能否触发替身的授权。
+ * app 发送方不走 canTalk（canTalk 是人路径的 talk 授权）；替身对 app 发送方的授权
+ * 就是这里的 senderPolicy：
+ *  - 'whitelist'（缺省）：sender 的 openId/unionId 必须命中 allowedSenders。
+ *    空白名单 = 不放开（= 既有行为，老配置升级零变化）。
+ *  - 'trustChat'：信任 chat 白名单（isSubstituteAllowedChat 已在调用前 gate 过 chat
+ *    ∈ chats）。trustChat 要求 chats 非空（save 层强制；此处对 hand-edit 的空 chats
+ *    配置也保守拒绝，避免退化为「任意应用在所有替身群触发」≈ 无条件放开）。
+ *
+ * sender 侧事件只带 open_id/union_id（无 app_id——app_id 只出现在 mentions 里），
+ * 故只按这两个 id 匹配。返回 true=放行进替身触发检测，false=按既有 foreign-bot 路径走。
+ */
+function senderPolicyAllowsAppSender(
+  cfg: { senderPolicy?: 'whitelist' | 'trustChat'; allowedSenders?: { openId?: string; unionId?: string }[]; chats?: string[] },
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+): boolean {
+  const policy = cfg.senderPolicy ?? 'whitelist';
+  if (policy === 'trustChat') {
+    return (cfg.chats?.length ?? 0) > 0;
+  }
+  const senders = cfg.allowedSenders ?? [];
+  if (!senders.length) return false;
+  return senders.some(s =>
+    (s.openId && senderOpenId && s.openId === senderOpenId) ||
+    (s.unionId && senderUnionId && s.unionId === senderUnionId));
+}
+
 function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boolean {
   const openId = mentionOpenId(m);
   if (botOpenId && openId === botOpenId) return true;
@@ -2155,6 +2184,63 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             } catch { /* content 非 JSON → 忽略 */ }
             logger.debug(`[${larkAppId}] hall bot message swallowed after learning (chat=${chatId.substring(0, 12)})`);
             return;
+          }
+          // ── Substitute trigger for app/bot senders (webhook cards, other bots) ──
+          // 开 A：非 self 的 app/bot 发送方在 senderPolicy 命中时，可触发替身（替其
+          // 回答被 @ 的替身目标人）。app 发送方不走 canTalk——替身对 app 发送方的
+          // 授权就是 senderPolicy（senderPolicyAllowsAppSender）。self-message 已在
+          // 上方 isSelfMessage 分支 return，故到这里 sender 必非 self：开 A =
+          // 「放开非 self 的 app 发送方」，不是「放开所有 app 发送方」。self-guard
+          // 在 resolveSubstituteTrigger 之前，杜绝替身回复带 @ 再次触发（回环）。
+          // 既有真人 text/post 替身路径零改动——这里只在 bot 分支里新增一条独立
+          // 替身腿，与 :2319 的人路径替身块同构（同套闸门 + senderPolicy）。
+          if (chatType === 'group') {
+            const subCfg = getBot(larkAppId).config.substituteMode;
+            if (subCfg?.enabled && subCfg.targets?.length && isSubstituteAllowedChat(subCfg, chatId)
+                && senderPolicyAllowsAppSender(subCfg, senderOpenId, senderUnionId)) {
+              const subChatMode = await getChatMode(larkAppId, chatId);
+              const modeSupported = subChatMode === 'group'
+                || (subChatMode === 'topic' && subCfg.topicGroups !== false);
+              if (modeSupported && isSubstituteEnabledForChat(larkAppId, chatId)) {
+                let substituteTrigger = resolveSubstituteTrigger(larkAppId, message);
+                // 与人路径 :2335 同：bot 未被显式 @ 且正文以 / 开头时不触发替身
+                // （让 @替身目标 + 斜杠命令仍按命令走 foreign-bot 路径）。
+                if (substituteTrigger && !isBotMentioned(larkAppId, message, senderOpenId)) {
+                  const rawText = extractMessageTextForRouting(message);
+                  const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
+                  if (stripped.startsWith('/')) substituteTrigger = undefined;
+                }
+                if (substituteTrigger) {
+                  const decision = await decideRoutingWithSource(larkAppId, message);
+                  let subScope: 'thread' | 'chat' = decision.scope;
+                  let subAnchor = decision.anchor;
+                  let subReplyRootId: string | undefined;
+                  if (subChatMode === 'group') {
+                    // 普通群：搭群 chat-scope 会话；独立 reply anchor 防同会话并发触发塌缩。
+                    subScope = 'chat';
+                    subAnchor = chatId;
+                    subReplyRootId = (message.root_id && message.thread_id) ? message.root_id : messageId;
+                  }
+                  // 话题群：保持 decideRouting 的话题锚点不动（替身回合搭该话题会话，
+                  // 无会话则 handleNewTopic 新开），回复天然落回本话题，无需 replyRootId。
+                  const subCtx: RoutingContext = {
+                    chatId, messageId, chatType, larkAppId,
+                    scope: subScope, anchor: subAnchor, substituteTrigger,
+                    ...(subReplyRootId ? { replyRootId: subReplyRootId } : {}),
+                  };
+                  const subOwns = handlers.isSessionOwner?.(subCtx.anchor, larkAppId) ?? false;
+                  logger.info(
+                    `[substitute:${larkAppId}] app-sender trigger sender=${(senderOpenId ?? senderUnionId ?? '?').substring(0, 12)} ` +
+                    `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)} → ${subChatMode === 'group' ? 'chat-scope' : `topic thread=${String(subAnchor).substring(0, 12)}`}`,
+                  );
+                  await serializeByAnchor(subCtx.anchor, () => subOwns
+                    ? handlers.handleThreadReply(data, subCtx)
+                    : handlers.handleNewTopic(data, subCtx))
+                    .catch(err => logger.error(`Error handling app-sender substitute: ${err}`));
+                  return;
+                }
+              }
+            }
           }
           // Foreign bot: only route on @mention of us.
           if (!isBotMentioned(larkAppId, message, undefined)) return;

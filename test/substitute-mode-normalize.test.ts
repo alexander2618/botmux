@@ -80,4 +80,45 @@ describe('normalizeSubstituteMode', () => {
     const cfg = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }], disableControlCard: true });
     expect(cfg).toMatchObject({ enabled: true, disableControlCard: true });
   });
+
+  it('defaults senderPolicy to whitelist', () => {
+    const cfg = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }] });
+    expect(cfg).toMatchObject({ senderPolicy: 'whitelist' });
+  });
+
+  it('preserves senderPolicy=trustChat and coerces invalid values to whitelist', () => {
+    const trust = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }], senderPolicy: 'trustChat' });
+    expect(trust).toMatchObject({ senderPolicy: 'trustChat' });
+    const invalid = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }], senderPolicy: 'bogus' });
+    expect(invalid).toMatchObject({ senderPolicy: 'whitelist' });
+    const absent = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }], senderPolicy: undefined });
+    expect(absent).toMatchObject({ senderPolicy: 'whitelist' });
+  });
+
+  it('normalizes allowedSenders: keeps openId/unionId/name, dedupes, drops empty entries', () => {
+    const cfg = normalizeSubstituteMode({
+      enabled: true,
+      targets: [{ openId: 'ou_alice' }],
+      allowedSenders: [
+        { openId: 'ou_wh', name: 'webhook A' },
+        { unionId: 'u_wh2' },
+        { openId: 'ou_wh' },               // dup of first → dropped
+        { openId: '  ', unionId: ' ' },   // both empty → dropped
+        { name: 'no id' },                 // no id → dropped
+        { openId: ' ou_wh3 ', name: '  ' },// trimmed; empty name omitted
+      ],
+    });
+    expect(cfg?.allowedSenders).toEqual([
+      { openId: 'ou_wh', name: 'webhook A' },
+      { unionId: 'u_wh2' },
+      { openId: 'ou_wh3' },
+    ]);
+  });
+
+  it('omits allowedSenders when empty / not an array', () => {
+    const a = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }], allowedSenders: [] });
+    expect(a).not.toHaveProperty('allowedSenders');
+    const b = normalizeSubstituteMode({ enabled: true, targets: [{ openId: 'ou_alice' }], allowedSenders: 'ou_x' });
+    expect(b).not.toHaveProperty('allowedSenders');
+  });
 });

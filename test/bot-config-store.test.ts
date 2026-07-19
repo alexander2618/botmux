@@ -256,6 +256,7 @@ describe('bot-config store', () => {
       disclosure: 'none',
       topicGroups: true,
       topicActiveSessionTrigger: true,
+      senderPolicy: 'whitelist',
       targets: [
         { userId: 'u_target', name: 'Target User' },
         { openId: 'ou_target', email: 'target@example.com' },
@@ -268,6 +269,7 @@ describe('bot-config store', () => {
       disclosure: 'prefix',
       topicGroups: true,
       topicActiveSessionTrigger: true,
+      senderPolicy: 'whitelist',
       targets: [{ userId: 'u_target' }],
     });
     // Enabled-but-unmatchable stays dropped: an ON state with no openId/userId/

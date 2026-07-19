@@ -1,4 +1,4 @@
-import { getBot, type SubstituteModeConfig, type SubstituteTarget } from '../bot-registry.js';
+import { getBot, getAllBots, effectiveBotDisplayName, type SubstituteModeConfig, type SubstituteTarget } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { normalizeSubstituteMode } from './substitute-mode-normalize.js';
 
@@ -25,6 +25,13 @@ export async function updateBotSubstituteMode(
   const normalized = normalizeSubstituteMode({ ...rec, chats: chats.length ? chats : undefined });
   if (rec.enabled === true && (!Array.isArray(rec.targets) || rec.targets.length === 0 || !normalized)) {
     return { ok: false, reason: 'targets_required' };
+  }
+  // 跨字段校验：trustChat 模式必须 chats 非空。chats 空 = 所有群（既有语义），
+  // 叠加 trustChat 的「群内任意应用触发」会退化为「任意应用在所有替身群触发」
+  // ≈ 无条件放开，已被否决的安全档。无论 enabled 与否都拒收——存下一个形如
+  // trustChat+空chats 的配置，日后被单独 toggle enabled 时不会重新过这道闸。
+  if (normalized && normalized.senderPolicy === 'trustChat' && !(normalized.chats?.length)) {
+    return { ok: false, reason: 'trustchat_requires_chats' };
   }
 
   const r = await rmwBotEntry<SubstituteModeConfig | null>(larkAppId, (entry) => {
@@ -163,4 +170,53 @@ export async function resolveSubstituteTargets(
   }
 
   return { targets, resolution };
+}
+
+// ── multi-bot cascade warning ─────────────────────────────────────────────
+
+/**
+ * 替身是 per-bot 配置：同一群里若 Bot A 和 Bot B 都开了替身且都配了同一替身目标，
+ * 一条 @替身目标 的消息（含 webhook 卡片）会让两者**同时触发**，群里出两条替身回复。
+ * 这是配置的固有性质，不做跨 bot 仲裁；本函数在 dashboard 保存替身配置后扫一遍
+ * 本部署其它已注册 bot，命中重叠就回一条告警文案让用户感知、主动隔离。
+ *
+ * 重叠判据（任一即告警）：
+ *   - 其它 bot 的替身 chats 与本 bot 的 chats 有交集（同群都可能触发）；
+ *   - 或两者都未设 chats（= 全群）——保守视为重叠。
+ * targets 重叠（同替身目标）也并入判据：同 target 更说明会双触发。
+ *
+ * 返回 null 表示无冲突。仅扫已注册 bot 的 in-memory 快照，不读盘、不阻塞。
+ */
+export function cascadeConflictWarning(
+  larkAppId: string,
+  mode: SubstituteModeConfig | null,
+): string | null {
+  if (!mode || !mode.enabled) return null;
+  // trustChat 才放开 bot/app 发送方（级联风险随 webhook 广播放大）；whitelist 仅
+  // 命中指定发送方，级联面窄，但同群多 bot 配同 target 的人路径仍会双触发——也告警。
+  const myChats = new Set(mode.chats ?? []);
+  const myTargetKeys = new Set(
+    (mode.targets ?? [])
+      .map(t => t.openId ?? t.userId ?? t.unionId)
+      .filter((v): v is string => !!v),
+  );
+  const offenders: string[] = [];
+  for (const other of getAllBots()) {
+    if (other.config.larkAppId === larkAppId) continue;
+    const om = other.config.substituteMode;
+    if (!om?.enabled) continue;
+    // chats 重叠：双方都没设 chats（=全群）视为重叠；否则取交集。
+    const chatsOverlap = (!myChats.size && !(om.chats?.length))
+      || [...myChats].some(c => om.chats?.includes(c));
+    const targetsOverlap = myTargetKeys.size > 0 && (om.targets ?? [])
+      .some(t => {
+        const k = t.openId ?? t.userId ?? t.unionId;
+        return !!k && myTargetKeys.has(k);
+      });
+    if (chatsOverlap || targetsOverlap) {
+      offenders.push(effectiveBotDisplayName(other));
+    }
+  }
+  if (!offenders.length) return null;
+  return `${offenders.join('、')} 也在本群/同替身目标上开了替身，一条 @ 会同时触发两者；建议同群只让一个 bot 配该替身目标。`;
 }

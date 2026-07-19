@@ -67,6 +67,7 @@ describe('substitute-mode store', () => {
         disclosure: 'none',
         topicGroups: true,
         topicActiveSessionTrigger: true,
+        senderPolicy: 'whitelist',
         targets: [
           { userId: 'u_alice', name: 'Alice' },
           { openId: 'ou_bob', email: 'bob@example.com' },
@@ -87,7 +88,7 @@ describe('substitute-mode store', () => {
     });
     expect(r).toEqual({
       ok: true,
-      substituteMode: { enabled: false, disclosure: 'prefix', topicGroups: true, topicActiveSessionTrigger: true, targets: [{ openId: 'ou_bob', name: 'Bob' }] },
+      substituteMode: { enabled: false, disclosure: 'prefix', topicGroups: true, topicActiveSessionTrigger: true, senderPolicy: 'whitelist', targets: [{ openId: 'ou_bob', name: 'Bob' }] },
     });
     expect(readConfig().substituteMode.enabled).toBe(false);
 
@@ -100,6 +101,7 @@ describe('substitute-mode store', () => {
       disclosure: 'prefix',
       topicGroups: true,
       topicActiveSessionTrigger: true,
+      senderPolicy: 'whitelist',
       targets: [{ openId: 'ou_bob', name: 'Bob' }],
     });
   });
@@ -202,6 +204,129 @@ describe('substitute-mode store', () => {
     if (r2.ok) {
       expect(r2.substituteMode?.topicGroups).toBe(true);
       expect(r2.substituteMode?.topicActiveSessionTrigger).toBe(true);
+    }
+  });
+
+  it('trustChat 模式 + 空 chats 被拒收（避免任意应用在所有群触发）', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob', name: 'Bob' }],
+      senderPolicy: 'trustChat',
+      // chats 缺省 → 空
+    });
+    expect(r).toEqual({ ok: false, reason: 'trustchat_requires_chats' });
+    expect(readConfig().substituteMode).toBeUndefined();
+  });
+
+  it('trustChat + 非空 chats 通过并持久化', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob', name: 'Bob' }],
+      senderPolicy: 'trustChat',
+      chats: ['oc_trusted'],
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.substituteMode).toMatchObject({ senderPolicy: 'trustChat', chats: ['oc_trusted'] });
+    }
+    expect(readConfig().substituteMode.senderPolicy).toBe('trustChat');
+  });
+
+  it('allowedSenders 往返：归一化、去重、持久化、重载', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob', name: 'Bob' }],
+      senderPolicy: 'whitelist',
+      allowedSenders: [
+        { openId: 'ou_wh1', name: 'webhook A' },
+        { openId: 'ou_wh1' },        // dup → dropped
+        { unionId: 'u_wh2' },
+        { openId: ' ' },              // empty → dropped
+      ],
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.substituteMode?.allowedSenders).toEqual([
+        { openId: 'ou_wh1', name: 'webhook A' },
+        { unionId: 'u_wh2' },
+      ]);
+      expect(r.substituteMode?.senderPolicy).toBe('whitelist');
+    }
+    expect(readConfig().substituteMode.allowedSenders).toEqual([
+      { openId: 'ou_wh1', name: 'webhook A' },
+      { unionId: 'u_wh2' },
+    ]);
+
+    // 重载后保留。
+    const reloaded = await freshModules();
+    reloaded.registry.loadBotConfigs().forEach(c => reloaded.registry.registerBot(c));
+    const cfg = reloaded.registry.getBot('app_default').config.substituteMode;
+    expect(cfg?.allowedSenders).toEqual([
+      { openId: 'ou_wh1', name: 'webhook A' },
+      { unionId: 'u_wh2' },
+    ]);
+  });
+
+  it('cascadeConflictWarning: 同 chat 重叠的其它 bot 命中告警', async () => {
+    writeConfig({
+      // 预置一个已注册的「其它 bot」也在 oc_shared 开替身
+      // （本测试用 writeConfig 只写一个 app_default，这里靠 store 给同 bot
+      // 设配置后改 appId 模拟第二个 bot——简化：直接注册两个 bot）。
+    });
+    // 写两个 bot 的配置文件
+    writeFileSync(configPath, JSON.stringify([
+      { larkAppId: 'app_default', larkAppSecret: 's', cliId: 'claude-code' },
+      { larkAppId: 'app_other', larkAppSecret: 's', cliId: 'claude-code',
+        displayName: 'OtherBot',
+        substituteMode: {
+          enabled: true,
+          targets: [{ openId: 'ou_bob' }],
+          chats: ['oc_shared'],
+          senderPolicy: 'whitelist',
+        } },
+    ], null, 2), 'utf-8');
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    // app_default 也开替身、chats 含 oc_shared → 与 app_other 重叠
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob' }],
+      chats: ['oc_shared', 'oc_mine'],
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const warn = store.cascadeConflictWarning('app_default', r.substituteMode);
+      expect(warn).toBeTruthy();
+      expect(warn).toContain('OtherBot');
+    }
+  });
+
+  it('cascadeConflictWarning: 无重叠 / 自身 disabled 时返回 null', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    const r = await store.updateBotSubstituteMode('app_default', {
+      enabled: true,
+      targets: [{ openId: 'ou_bob' }],
+      chats: ['oc_only_mine'],
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(store.cascadeConflictWarning('app_default', r.substituteMode)).toBeNull();
+      expect(store.cascadeConflictWarning('app_default', null)).toBeNull();
     }
   });
 });

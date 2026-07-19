@@ -25,6 +25,12 @@ export type BotSubstituteTarget = {
   avatarUrl?: string;
 };
 
+export type BotSubstituteAllowedSender = {
+  openId?: string;
+  unionId?: string;
+  name?: string;
+};
+
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
@@ -36,6 +42,10 @@ export type BotSubstituteMode = {
   topicGroups?: boolean;
   /** 话题里已有本 bot 活跃会话时是否仍触发替身（缺省 true）。 */
   topicActiveSessionTrigger?: boolean;
+  /** 谁可以触发替身（缺省 'whitelist'）。见 SubstituteModeConfig.senderPolicy。 */
+  senderPolicy?: 'whitelist' | 'trustChat';
+  /** whitelist 模式下的可信发送方清单（openId/unionId）。trustChat 模式不参与匹配。 */
+  allowedSenders?: BotSubstituteAllowedSender[];
 };
 
 export type BotDefaultsRow = {

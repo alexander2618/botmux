@@ -782,6 +782,28 @@ export interface SubstituteModeConfig {
   /** 话题里已有本 bot 活跃会话时是否仍触发替身（替身回合注入该会话）。false 时
    *  回落到原让路行为（@别人=转交别人，保持沉默）。仅话题群路径生效，缺省 true。 */
   topicActiveSessionTrigger?: boolean;
+  /** 谁可以触发替身——决定 bot/app 发送方（webhook 卡片、其它 bot 应用）能否触发替身。
+   *  - 'whitelist'（缺省）：仅 allowedSenders 白名单内的发送方触发；空白名单 = 不放开
+   *    （= 既有行为，老配置升级零变化）。
+   *  - 'trustChat'：在替身白名单群（chats）内，任何 bot/app 发送方 @替身目标都触发。
+   *    保存时强制 chats 非空，堵「空 chats=全群信任任意应用」退化为无条件放开。
+   *  仅群聊路径生效；p2p 不触发替身。 */
+  senderPolicy?: 'whitelist' | 'trustChat';
+  /** senderPolicy='whitelist' 下的可信发送方清单。sender 侧事件只带 open_id/union_id
+   *  （无 app_id——app_id 只出现在 mentions 里），故此处只收 openId/unionId，按任一命中
+   *  即放行。trustChat 模式下本字段不参与匹配（归一化仍保留以利来回切换）。 */
+  allowedSenders?: SubstituteAllowedSender[];
+}
+
+/** 替身发送方白名单条目。与 SubstituteTarget 不同：这是「谁可以触发替身」的发送方
+ *  身份（webhook bot / 其它应用），不是「被替身的人」。只按 openId/unionId 匹配 sender。 */
+export interface SubstituteAllowedSender {
+  /** App-scoped open_id（ou_…）。事件 sender.sender_id.open_id。 */
+  openId?: string;
+  /** 租户稳定 union_id（u_…）。事件 sender.sender_id.union_id。比 open_id 更稳。 */
+  unionId?: string;
+  /** 人类可读标签，仅用于 dashboard 展示。 */
+  name?: string;
 }
 
 export interface VcMeetingAgentConfig {

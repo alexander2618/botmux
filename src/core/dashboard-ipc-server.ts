@@ -1889,9 +1889,16 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
     // 话题群开关：显式 false 才关（旧客户端不带字段 → normalize 缺省开）。
     topicGroups: rec.topicGroups,
     topicActiveSessionTrigger: rec.topicActiveSessionTrigger,
+    // 发送方策略：whitelist（缺省）/ trustChat。allowedSenders 只收 openId/unionId，
+    // 不走 resolveSubstituteTargets（那是「被替身的人」的解析；发送方是 bot/app，
+    // sender 侧无 app_id，直接存用户填的 openId/unionId）。
+    senderPolicy: rec.senderPolicy === 'trustChat' ? 'trustChat' : 'whitelist',
+    allowedSenders: Array.isArray(rec.allowedSenders) ? rec.allowedSenders : [],
   });
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, resolution });
-  jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution });
+  // 多 bot 级联感知：本部署其它 bot 是否也在同 chat/同 target 上开了替身。只读告警。
+  const cascade = substituteModeStore.cascadeConflictWarning(cachedLarkAppId, r.substituteMode);
+  jsonRes(res, 200, { ok: true, substituteMode: r.substituteMode, resolution, cascade });
 });
 
 // Preview resolution for a single substitute target without persisting anything.

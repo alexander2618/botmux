@@ -120,28 +120,78 @@ export function extractMentionIdentities(message: {
   content?: string;
 } | null | undefined): MentionIdentity[] {
   const out = (message?.mentions ?? []).map(mentionIdentity);
+  // 去重键：openId 优先，否则 unionId。卡片 at 节点产出 openId，可能与顶层
+  // message.mentions[] 重复（标准 <at id=ou_xxx> 卡片会被飞书回填进顶层 mentions[]），
+  // 去重避免替身匹配时同一人被当两次。
+  const seen = new Set<string>();
+  for (const m of out) {
+    const k = m.openId ?? m.unionId;
+    if (k) seen.add(k);
+  }
   try {
     const content = JSON.parse(message?.content ?? '{}');
+    // post 富文本 at 节点（既有路径）
     const inner = content.zh_cn ?? content.en_us ?? content;
     if (Array.isArray(inner?.content)) {
       for (const paragraph of inner.content) {
         if (!Array.isArray(paragraph)) continue;
         for (const node of paragraph) {
           if (node?.tag !== 'at') continue;
-          // In post/rich-text content Lark carries the mentionee's OPEN_ID in the
-          // at-node's `user_id` field (cf. isBotMentioned, which compares
-          // node.user_id against botOpenId), NOT a tenant user_id. Map it to
-          // openId only — mislabeling it as userId would both miss a userId-only
-          // target and pollute the userId leg with an open_id value.
-          out.push({
-            name: node.user_name,
-            openId: node.user_id,
-          });
+          if (!collectCardAtNode(node, out, seen)) continue;
         }
       }
     }
+    // interactive 卡片：递归收集 body.elements / elements 里的 tag:'at' 节点。
+    // 只认元素形态的 at 节点（简化格式 A 的 [[{tag:'at',user_id,user_name}],…]）；
+    // 不扫 lark_md/markdown 字符串里的 <at id=…>——那些已被飞书回填进顶层
+    // message.mentions[]（:122 已收），再扫会重复。name-only(无 user_id)/@all 跳过。
+    if (content && typeof content === 'object' && !Array.isArray(content)) {
+      const rootElements = Array.isArray(content.body?.elements)
+        ? content.body.elements
+        : Array.isArray(content.elements) ? content.elements : null;
+      if (rootElements) walkCardAtNodes(rootElements, out, seen);
+    }
   } catch { /* ignore non-JSON content */ }
   return out;
+}
+
+/** 把一个 post/卡片 at 节点收进 out。返回是否产出了有效 mention。
+ *  - user_id 字段实为 open_id（与 post at 节点同坑，见 :131-138 注释），映射成 openId。
+ *  - user_id 为 'all'/'everyone'（@所有人）或缺失 → 跳过（替身按人匹配，@all 不是人）。
+ *  - 已在 seen 里的 openId → 跳过去重。 */
+function collectCardAtNode(node: any, out: MentionIdentity[], seen: Set<string>): boolean {
+  const uid = typeof node?.user_id === 'string' ? node.user_id.trim() : '';
+  if (!uid || uid === 'all' || uid === 'everyone') return false;
+  if (seen.has(uid)) return false;
+  seen.add(uid);
+  out.push({
+    name: typeof node?.user_name === 'string' ? node.user_name : undefined,
+    openId: uid,
+  });
+  return true;
+}
+
+/** 递归遍历卡片 elements（兼容简化格式 A 的二维数组与 v2 一维数组），收集 tag:'at' 节点。
+ *  容器节点（column_set/columns/note/actions/elements/fields/extra/horizontal）继续下钻。 */
+function walkCardAtNodes(elements: any, out: MentionIdentity[], seen: Set<string>): void {
+  if (Array.isArray(elements)) {
+    for (const el of elements) walkCardAtNodes(el, out, seen);
+    return;
+  }
+  if (!elements || typeof elements !== 'object') return;
+  const tag = elements.tag;
+  if (tag === 'at') { collectCardAtNode(elements, out, seen); return; }
+  // 下钻常见容器字段。卡片结构里 @ 只会出现在这些嵌套层；不扫 text/lark_md
+  // 字符串内容（避免重复解析已被顶层 mentions[] 覆盖的标准 @）。
+  for (const key of ['elements', 'actions', 'fields', 'extra', 'columns', 'children']) {
+    const v = (elements as Record<string, any>)[key];
+    if (Array.isArray(v)) for (const c of v) walkCardAtNodes(c, out, seen);
+    else if (v && typeof v === 'object') walkCardAtNodes(v, out, seen);
+  }
+  // column_set 的 columns 可能在 column[] 里
+  if (Array.isArray((elements as Record<string, any>).column_elements)) {
+    for (const c of (elements as Record<string, any>).column_elements) walkCardAtNodes(c, out, seen);
+  }
 }
 
 export function mentionUnionId(m: { id?: { union_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
